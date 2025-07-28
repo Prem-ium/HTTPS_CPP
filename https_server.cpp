@@ -97,7 +97,7 @@ int main() {
         if (SSL_accept(ssl) <= 0) {
             ERR_print_errors_fp(stderr);
         } else {
-            const char* reply = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nOMG I'm gonna cry-- it works. I'm aliveeeee. Hello, World!";
+            const char* reply = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nI'm aliveee--Hello, World!";
             SSL_write(ssl, reply, strlen(reply));
         }
 
