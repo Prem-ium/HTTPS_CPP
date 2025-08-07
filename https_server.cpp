@@ -1,122 +1,79 @@
-// Include necessary headers
+// mbedtls_https_server.cpp
 #include <iostream>
-#include <openssl/ssl.h>
-#include <openssl/err.h>
-
-#ifdef _WIN32 // If compiling on Windows
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#pragma comment(lib, "ws2_32.lib")
-#else // If compiling on Unix-like systems
+#include <cstring>
+#include <cstdlib>
 #include <unistd.h>
-#include <arpa/inet.h>
 #include <netinet/in.h>
-#include <sys/socket.h>
-#endif
+#include <mbedtls/net_sockets.h>
+#include <mbedtls/ssl.h>
+#include <mbedtls/entropy.h>
+#include <mbedtls/ctr_drbg.h>
+#include <mbedtls/certs.h>
+#include <mbedtls/error.h>
 
-#define PORT 4433
-
-// Initialize & Clean-up openSSL
-void init_openssl() {
-    SSL_load_error_strings();
-    OpenSSL_add_ssl_algorithms();
-}
-void cleanup_openssl() {
-    EVP_cleanup();
-}
-
-
-SSL_CTX* create_context() {
-    const SSL_METHOD* method = TLS_server_method();
-    SSL_CTX* ctx = SSL_CTX_new(method);
-    if (!ctx) {
-        perror("Unable to create SSL context");
-        exit(EXIT_FAILURE);
-    }
-    return ctx;
-}
-
-void configure_context(SSL_CTX* ctx) {
-    if (SSL_CTX_use_certificate_file(ctx, "cert.pem", SSL_FILETYPE_PEM) <= 0 ||
-        SSL_CTX_use_PrivateKey_file(ctx, "key.pem", SSL_FILETYPE_PEM) <= 0) {
-        ERR_print_errors_fp(stderr);
-        exit(EXIT_FAILURE);
-    }
-}
+#define SERVER_PORT "4433"
 
 int main() {
-#ifdef _WIN32
-    // Windows: Initialize Winsock
-    WSADATA wsaData;
-    WSAStartup(MAKEWORD(2, 2), &wsaData);
-#endif
+    mbedtls_net_context listen_fd, client_fd;
+    mbedtls_ssl_context ssl;
+    mbedtls_ssl_config conf;
+    mbedtls_x509_crt cert;
+    mbedtls_pk_context pkey;
+    mbedtls_entropy_context entropy;
+    mbedtls_ctr_drbg_context ctr_drbg;
+    const char* pers = "ssl_server";
 
-    init_openssl();
-    SSL_CTX* ctx = create_context();
-    configure_context(ctx);
+    mbedtls_net_init(&listen_fd);
+    mbedtls_net_init(&client_fd);
+    mbedtls_ssl_init(&ssl);
+    mbedtls_ssl_config_init(&conf);
+    mbedtls_x509_crt_init(&cert);
+    mbedtls_pk_init(&pkey);
+    mbedtls_entropy_init(&entropy);
+    mbedtls_ctr_drbg_init(&ctr_drbg);
 
-    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd < 0) {
-        perror("Socket creation failed");
-        return 1;
+    // Seed RNG
+    mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy,
+                          (const unsigned char*)pers, strlen(pers));
+
+    // Load cert/key
+    mbedtls_x509_crt_parse_file(&cert, "cert.pem");
+    mbedtls_pk_parse_keyfile(&pkey, "key.pem", nullptr);
+
+    // Bind to port
+    mbedtls_net_bind(&listen_fd, nullptr, SERVER_PORT, MBEDTLS_NET_PROTO_TCP);
+
+    // SSL config
+    mbedtls_ssl_config_defaults(&conf,
+        MBEDTLS_SSL_IS_SERVER,
+        MBEDTLS_SSL_TRANSPORT_STREAM,
+        MBEDTLS_SSL_PRESET_DEFAULT);
+    mbedtls_ssl_conf_rng(&conf, mbedtls_ctr_drbg_random, &ctr_drbg);
+    mbedtls_ssl_conf_ca_chain(&conf, cert.next, nullptr);
+    mbedtls_ssl_conf_own_cert(&conf, &cert, &pkey);
+    mbedtls_ssl_setup(&ssl, &conf);
+
+    std::cout << "Waiting for client on port " << SERVER_PORT << "...\n";
+    mbedtls_net_accept(&listen_fd, &client_fd, nullptr, 0, nullptr);
+    mbedtls_ssl_set_bio(&ssl, &client_fd, mbedtls_net_send, mbedtls_net_recv, nullptr);
+
+    if (mbedtls_ssl_handshake(&ssl) != 0) {
+        std::cerr << "TLS handshake failed\n";
+    } else {
+        char buffer[1024];
+        mbedtls_ssl_read(&ssl, (unsigned char*)buffer, sizeof(buffer) - 1);
+        const char* resp =
+            "HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nHello, HTTPS!";
+        mbedtls_ssl_write(&ssl, (const unsigned char*)resp, strlen(resp));
     }
 
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(PORT);
-    addr.sin_addr.s_addr = INADDR_ANY;
-
-    if (bind(server_fd, (sockaddr*)&addr, sizeof(addr)) < 0) {
-        perror("Bind failed");
-        return 1;
-    }
-
-    if (listen(server_fd, 1) < 0) {
-        perror("Listen failed");
-        return 1;
-    }
-
-    std::cout << "Server running on https://localhost:" << PORT << std::endl;
-
-    while (1) {
-        sockaddr_in client;
-#ifdef _WIN32
-        int len = sizeof(client);
-#else
-        socklen_t len = sizeof(client);
-#endif
-        int client_fd = accept(server_fd, (sockaddr*)&client, &len);
-        if (client_fd < 0) {
-            perror("Accept failed");
-            continue;
-        }
-
-        SSL* ssl = SSL_new(ctx);
-        SSL_set_fd(ssl, client_fd);
-
-        if (SSL_accept(ssl) <= 0) {
-            ERR_print_errors_fp(stderr);
-        } else {
-            const char* reply = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nI'm aliveee--Hello, World!";
-            SSL_write(ssl, reply, strlen(reply));
-        }
-
-        SSL_shutdown(ssl);
-        SSL_free(ssl);
-#ifdef _WIN32
-        closesocket(client_fd);
-#else
-        close(client_fd);
-#endif
-    }
-
-#ifdef _WIN32
-    closesocket(server_fd);
-    WSACleanup();
-#else
-    close(server_fd);
-#endif
-    SSL_CTX_free(ctx);
-    cleanup_openssl();
-    return 0;
+    mbedtls_ssl_close_notify(&ssl);
+    mbedtls_net_free(&client_fd);
+    mbedtls_net_free(&listen_fd);
+    mbedtls_ssl_free(&ssl);
+    mbedtls_ssl_config_free(&conf);
+    mbedtls_x509_crt_free(&cert);
+    mbedtls_pk_free(&pkey);
+    mbedtls_ctr_drbg_free(&ctr_drbg);
+    mbedtls_entropy_free(&entropy);
 }
